@@ -1,6 +1,7 @@
 from google import genai
 from google.genai import types
 from backend.config import GEMINI_API_KEY, GEMINI_MODEL
+import time
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -37,8 +38,7 @@ Sources:
 
 def query_gemini(user_question: str, retrieved_docs: list[dict]) -> str:
     context = build_context(retrieved_docs)
-
-    prompt = f"""Here are the relevant medical documents:
+    prompt  = f"""Here are the relevant medical documents:
 
 {context}
 
@@ -49,22 +49,36 @@ User Question: {user_question}
 Based ONLY on the documents above, provide a detailed answer about 
 the drug interaction, following the format in your instructions."""
 
-    try:
-        response = client.models.generate_content(
-            model    = GEMINI_MODEL,
-            contents = prompt,
-            config   = types.GenerateContentConfig(
-                system_instruction = SYSTEM_PROMPT,
-                temperature        = 0.1,
-                max_output_tokens  = 1024,
+    # Retry up to 3 times on 503
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model    = GEMINI_MODEL,
+                contents = [
+                    types.Content(
+                        role  = "user",
+                        parts = [types.Part(text=prompt)]
+                    )
+                ],
+                config = types.GenerateContentConfig(
+                    system_instruction = SYSTEM_PROMPT,
+                    temperature        = 0.1,
+                    max_output_tokens  = 2048,
+                    automatic_function_calling = types.AutomaticFunctionCallingConfig(
+                        disable = True
+                    ),
+                )
             )
-        )
-        return response.text
+            return response.text
 
-    except Exception as e:
-        return f"Error generating response: {str(e)}"
-
-
+        except Exception as e:
+            err = str(e)
+            if "503" in err and attempt < 2:
+                print(f"  Gemini busy, retrying in 10s... (attempt {attempt+1}/3)")
+                time.sleep(10)
+                continue
+            return f"Error generating response: {err}"
+    
 def build_context(retrieved_docs: list[dict]) -> str:
     if not retrieved_docs:
         return "No relevant documents found in the knowledge base."

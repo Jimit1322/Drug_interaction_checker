@@ -40,6 +40,39 @@ def get_chroma_collection():
     )
     return collection
 
+# Add this function
+def is_actual_drug(chunks: list[dict]) -> bool:
+    """
+    Returns True only if this is a real medicine.
+    Filters out cosmetics, sunscreens, sanitizers, supplements.
+    """
+    if not chunks:
+        return False
+
+    # Must have a DRUG INTERACTIONS or WARNINGS section
+    sections = [c["section"] for c in chunks]
+    has_interaction_section = any(
+        s in ["DRUG INTERACTIONS", "CONTRAINDICATIONS",
+              "WARNINGS AND PRECAUTIONS", "WARNINGS"]
+        for s in sections
+    )
+    if not has_interaction_section:
+        return False
+
+    # Skip cosmetics / OTC personal care
+    drug_name_lower = chunks[0]["drug_name"].lower()
+    SKIP_KEYWORDS   = [
+        "sunscreen", "lotion", "sanitizer", "moisturizer",
+        "shampoo", "conditioner", "soap", "cream", "spf",
+        "lip balm", "deodorant", "toothpaste", "mouthwash",
+        "mascara", "foundation", "blush", "nail", "perfume",
+        "fragrance", "baby powder", "hand wash", "body wash",
+        "clip & go", "sunset", "hibiscus", "coconut",
+    ]
+    if any(kw in drug_name_lower for kw in SKIP_KEYWORDS):
+        return False
+
+    return True
 
 # ── Step 1: Get list of all drug SPL IDs from DailyMed ───────
 def fetch_drug_list(limit=500):
@@ -97,72 +130,74 @@ def fetch_drug_label_xml(set_id: str) -> str | None:
 
 # ── Step 3: Parse XML → extract useful sections ───────────────
 def parse_drug_label(xml_text: str, set_id: str) -> list[dict]:
-    """
-    Parses FDA SPL XML and extracts key sections.
-    
-    Returns list of chunks — we split by section so each chunk
-    is focused on one topic (interactions, warnings, etc.)
-    This gives better RAG retrieval than one giant document.
-    """
-    soup = BeautifulSoup(xml_text, "lxml-xml")
+    soup   = BeautifulSoup(xml_text, "lxml-xml")
     chunks = []
 
-    # ── Extract drug name ──────────────────────────────────────
+    # ── Fix: Extract drug name from title or manufacturedProduct ──
     drug_name = "Unknown"
-    name_tag  = soup.find("name")
-    if name_tag:
-        drug_name = name_tag.get_text(strip=True)
 
-    # ── Extract manufacturer ───────────────────────────────────
+    # Try <title> first — most reliable in SPL format
+    title_tag = soup.find("title")
+    if title_tag:
+        drug_name = title_tag.get_text(strip=True)[:100]
+
+    # Fallback: <manufacturedProduct> → <name>
+    if drug_name == "Unknown" or len(drug_name) < 2:
+        mfg_product = soup.find("manufacturedProduct")
+        if mfg_product:
+            name_tag = mfg_product.find("name")
+            if name_tag:
+                drug_name = name_tag.get_text(strip=True)[:100]
+
+    # Fallback: <subject> → <name>
+    if drug_name == "Unknown" or len(drug_name) < 2:
+        subject = soup.find("subject")
+        if subject:
+            name_tag = subject.find("name")
+            if name_tag:
+                drug_name = name_tag.get_text(strip=True)[:100]
+
+    # Clean up drug name — remove dosage forms appended to name
+    # e.g. "IBUPROFEN tablet" → "IBUPROFEN"
+    drug_name = drug_name.split("\n")[0].strip()
+
+    # ── Extract manufacturer (separate from drug name) ────────────
     manufacturer = "Unknown"
-    mfr_tag = soup.find("manufacturerOrganization")
-    if mfr_tag:
-        name_el = mfr_tag.find("name")
-        if name_el:
-            manufacturer = name_el.get_text(strip=True)
+    for org_tag in soup.find_all("representedOrganization"):
+        name_tag = org_tag.find("name")
+        if name_tag:
+            manufacturer = name_tag.get_text(strip=True)[:100]
+            break
 
-    # ── Extract active ingredients ─────────────────────────────
+    # ── Extract active ingredients ─────────────────────────────────
     ingredients = []
     for ingr in soup.find_all("activeIngredient"):
         n = ingr.find("name")
         if n:
             ingredients.append(n.get_text(strip=True))
 
-    # ── Section codes we care about ────────────────────────────
-    # These are standard FDA section codes in SPL format
+    # ── Section codes ──────────────────────────────────────────────
     SECTION_CODES = {
-        "34073-7":  "DRUG INTERACTIONS",
-        "34071-1":  "WARNINGS",
-        "34084-4":  "ADVERSE REACTIONS",
-        "34067-9":  "INDICATIONS AND USAGE",
-        "34068-7":  "DOSAGE AND ADMINISTRATION",
-        "34070-3":  "CONTRAINDICATIONS",
-        "43685-7":  "WARNINGS AND PRECAUTIONS",
+        "34073-7": "DRUG INTERACTIONS",
+        "34071-1": "WARNINGS",
+        "34084-4": "ADVERSE REACTIONS",
+        "34067-9": "INDICATIONS AND USAGE",
+        "34068-7": "DOSAGE AND ADMINISTRATION",
+        "34070-3": "CONTRAINDICATIONS",
+        "43685-7": "WARNINGS AND PRECAUTIONS",
     }
 
-    # ── Extract each section ───────────────────────────────────
     for code, section_name in SECTION_CODES.items():
-        # SPL uses <code code="34073-7"> inside <section>
         section_tag = soup.find("code", {"code": code})
-
         if not section_tag:
             continue
-
-        # The section's parent holds the actual text
         parent = section_tag.find_parent("section")
         if not parent:
             continue
-
-        # Extract all text from this section
         text = parent.get_text(separator=" ", strip=True)
-
-        # Skip very short or empty sections
         if len(text) < 50:
             continue
-
-        # Chunk text if very long (ChromaDB works best under 1000 chars)
         text_chunks = chunk_text(text, max_chars=900, overlap=100)
-
         for i, chunk in enumerate(text_chunks):
             chunks.append({
                 "id":           f"{set_id}_{code}_{i}",
@@ -175,7 +210,6 @@ def parse_drug_label(xml_text: str, set_id: str) -> list[dict]:
                 "source":       "FDA DailyMed",
             })
 
-    # ── If no structured sections found, use raw text ──────────
     if not chunks:
         raw = soup.get_text(separator=" ", strip=True)[:2000]
         if raw:
@@ -191,7 +225,6 @@ def parse_drug_label(xml_text: str, set_id: str) -> list[dict]:
             })
 
     return chunks
-
 
 def chunk_text(text: str, max_chars: int = 900, overlap: int = 100) -> list[str]:
     """
@@ -306,10 +339,12 @@ def run_fda_ingestion(limit: int = 500, save_xml: bool = False):
 
         # Parse and store
         chunks = parse_drug_label(xml_text, set_id)
-        if chunks:
+        if chunks and is_actual_drug(chunks):
             store_chunks(collection, chunks)
             total_chunks += len(chunks)
             success += 1
+        else :
+            skipped += 1
 
         # Polite delay
         time.sleep(0.2)
