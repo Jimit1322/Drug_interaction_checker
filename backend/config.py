@@ -16,4 +16,11 @@ PUBMED_COLLECTION = "pubmed_abstracts"
 TOP_K = 8
 
 # Gemini model
-GEMINI_MODEL = "gemini-3.6-flash"     # free tier model
+GEMINI_MODEL = "gemini-3.8-flash"   # primary
+
+GEMINI_FALLBACK_MODELS = [
+   "gemini-3.8-flash",
+   "gemini-3.5-flash",
+    # "gemini-2.0-flash",
+   
+]   # free tier model

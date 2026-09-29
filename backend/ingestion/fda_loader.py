@@ -130,43 +130,63 @@ def fetch_drug_label_xml(set_id: str) -> str | None:
 
 # ── Step 3: Parse XML → extract useful sections ───────────────
 def parse_drug_label(xml_text: str, set_id: str) -> list[dict]:
-    soup   = BeautifulSoup(xml_text, "lxml-xml")
-    chunks = []
-
-    # ── Fix: Extract drug name from title or manufacturedProduct ──
+    soup      = BeautifulSoup(xml_text, "lxml-xml")
+    chunks    = []
     drug_name = "Unknown"
 
-    # Try <title> first — most reliable in SPL format
-    title_tag = soup.find("title")
-    if title_tag:
-        drug_name = title_tag.get_text(strip=True)[:100]
+    # ── Strategy 1: ingredientSubstance name (most reliable) ──────
+    substance = soup.find("ingredientSubstance")
+    if substance:
+        name_tag = substance.find("name")
+        if name_tag:
+            drug_name = name_tag.get_text(strip=True)[:80]
 
-    # Fallback: <manufacturedProduct> → <name>
-    if drug_name == "Unknown" or len(drug_name) < 2:
-        mfg_product = soup.find("manufacturedProduct")
-        if mfg_product:
-            name_tag = mfg_product.find("name")
+    # ── Strategy 2: manufacturedProduct → name ─────────────────────
+    if drug_name == "Unknown":
+        for tag in soup.find_all("manufacturedProduct"):
+            name_tag = tag.find("name")
             if name_tag:
-                drug_name = name_tag.get_text(strip=True)[:100]
+                val = name_tag.get_text(strip=True)[:80]
+                # skip if it looks like a sentence (not a drug name)
+                if len(val.split()) <= 6 and len(val) < 60:
+                    drug_name = val
+                    break
 
-    # Fallback: <subject> → <name>
-    if drug_name == "Unknown" or len(drug_name) < 2:
+    # ── Strategy 3: first <name> inside <subject> ──────────────────
+    if drug_name == "Unknown":
         subject = soup.find("subject")
         if subject:
             name_tag = subject.find("name")
             if name_tag:
-                drug_name = name_tag.get_text(strip=True)[:100]
+                val = name_tag.get_text(strip=True)[:80]
+                if len(val.split()) <= 6:
+                    drug_name = val
 
-    # Clean up drug name — remove dosage forms appended to name
-    # e.g. "IBUPROFEN tablet" → "IBUPROFEN"
+    # ── Strategy 4: parse from title ───────────────────────────────
+    if drug_name == "Unknown":
+        title_tag = soup.find("title")
+        if title_tag:
+            raw   = title_tag.get_text(strip=True)
+            # Title looks like "IBUPROFEN- ibuprofen tablet"
+            # Take the part before first dash or newline
+            clean = raw.split("-")[0].split("\n")[0].strip()[:80]
+            if len(clean.split()) <= 6 and len(clean) > 2:
+                drug_name = clean
+
+    # ── Clean up ───────────────────────────────────────────────────
+    # Remove dosage info appended after drug name
+    # "WARFARIN SODIUM 5mg" → "WARFARIN SODIUM"
+    import re
+    drug_name = re.sub(r'\s+\d+\s*(mg|mcg|ml|%|g)\b.*', '',
+                       drug_name, flags=re.IGNORECASE).strip()
     drug_name = drug_name.split("\n")[0].strip()
 
-    # ── Extract manufacturer (separate from drug name) ────────────
+    # ── Extract manufacturer ───────────────────────────────────────
     manufacturer = "Unknown"
-    for org_tag in soup.find_all("representedOrganization"):
-        name_tag = org_tag.find("name")
-        if name_tag:
-            manufacturer = name_tag.get_text(strip=True)[:100]
+    for org in soup.find_all("representedOrganization"):
+        n = org.find("name")
+        if n:
+            manufacturer = n.get_text(strip=True)[:100]
             break
 
     # ── Extract active ingredients ─────────────────────────────────
@@ -176,7 +196,12 @@ def parse_drug_label(xml_text: str, set_id: str) -> list[dict]:
         if n:
             ingredients.append(n.get_text(strip=True))
 
-    # ── Section codes ──────────────────────────────────────────────
+    # ── If no good drug name, use first ingredient ─────────────────
+    if (drug_name == "Unknown" or len(drug_name) < 2
+            or "highlights" in drug_name.lower()) and ingredients:
+        drug_name = ingredients[0]
+
+    # ── Section extraction (unchanged) ────────────────────────────
     SECTION_CODES = {
         "34073-7": "DRUG INTERACTIONS",
         "34071-1": "WARNINGS",
@@ -339,12 +364,11 @@ def run_fda_ingestion(limit: int = 500, save_xml: bool = False):
 
         # Parse and store
         chunks = parse_drug_label(xml_text, set_id)
-        if chunks and is_actual_drug(chunks):
+        if chunks:
             store_chunks(collection, chunks)
             total_chunks += len(chunks)
             success += 1
-        else :
-            skipped += 1
+        
 
         # Polite delay
         time.sleep(0.2)

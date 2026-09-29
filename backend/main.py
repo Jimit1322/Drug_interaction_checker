@@ -103,7 +103,7 @@ async def query_drug_interaction(request: QueryRequest):
     )
 
 
-# backend/main.py — replace the /drugs/search endpoint
+# backend/main.py — replace /drugs/search endpoint
 @app.get("/drugs/search")
 async def search_drugs(q: str):
     if not q or len(q) < 2:
@@ -118,29 +118,30 @@ async def search_drugs(q: str):
                          model_name="all-MiniLM-L6-v2")
         collection = client.get_collection(FDA_COLLECTION, embedding_function=ef)
 
-        # Get all metadata without where filter
+        # Get larger sample
         results = collection.get(
-            limit   = 500,
+            limit   = 2000,
             include = ["metadatas"]
         )
 
         drug_names = set()
         q_lower    = q.lower()
+
         for meta in results["metadatas"]:
-            name = meta.get("drug_name", "")
-            # Filter: must start with query, reasonable length, no company names
-            if (name.lower().startswith(q_lower)
-                    and len(name) < 40
-                    and "LLC" not in name
-                    and "Inc" not in name
-                    and "Corp" not in name
-                    and "Pharma" not in name):
+            name = meta.get("drug_name", "").strip()
+            if (name
+                    and name.lower().startswith(q_lower)
+                    and 2 < len(name) < 50
+                    and name != "Unknown"
+                    and not any(c.isdigit() for c in name[:3])):
                 drug_names.add(name.title())
 
         return {"drugs": sorted(list(drug_names))[:10]}
 
     except Exception as e:
         return {"drugs": [], "error": str(e)}
+    
+    
 @app.get("/stats")
 async def get_stats():
     """Returns knowledge base statistics."""
